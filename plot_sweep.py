@@ -50,12 +50,20 @@ for cfg_dir in sorted((d for d in SWEEP.iterdir() if d.is_dir()), key=cfg_key):
         mon = cfg_dir / f"monitor-rate-{rate}.csv"
         if mon.exists():
             m = list(csv.DictReader(mon.open()))
-            col = lambda k: [float(x[k]) for x in m if x[k] != ""]
+            col = lambda k: [float(x[k]) for x in m if x.get(k) not in ("", None)]
             mean = lambda v: sum(v) / len(v) if v else float("nan")
+            delta = lambda v: v[-1] - v[0] if len(v) > 1 else float("nan")
+            secs = delta(col("t_s"))
             s.setdefault("mon_rates", []).append(rate)
             s.setdefault("gpu_util", []).append(mean(col("gpu_util")))
             s.setdefault("cpu_vllm", []).append(mean(col("cpu_vllm")))
             s.setdefault("kv_peak", []).append(max(col("kv_cache"), default=float("nan")) * 100)
+            # cumulative vLLM counters -> per-run values (counters reset per server)
+            q_n = delta(col("queue_time_count"))
+            s.setdefault("queue_ms", []).append(
+                delta(col("queue_time_sum")) / q_n * 1000 if q_n and q_n > 0 else float("nan"))
+            s.setdefault("preempt", []).append(delta(col("preemptions")))
+            s.setdefault("srv_gen_tps", []).append(delta(col("gen_tokens")) / secs)
         s["ttft"].append(p95([r["ttft_s"] for r in ok]))
         s["tpot"].append(p95([r["tpot_s"] for r in ok if r["tpot_s"] is not None]) * 1000)
     if s["rates"]:
@@ -114,15 +122,20 @@ print("Saved plots/sweep_throughput.png")
 
 monitored = {cfg: s for cfg, s in summary.items() if s.get("mon_rates")}
 if monitored:
-    fig, axes = plt.subplots(1, 3, figsize=(16, 4.5))
+    panels = [("gpu_util", "Mean GPU utilization (%)"),
+              ("cpu_vllm", "Mean vLLM CPU (%, 100 = one core)"),
+              ("kv_peak", "Peak KV cache usage (%)"),
+              ("queue_ms", "Mean queue time (ms, vLLM)"),
+              ("preempt", "Preemptions per run"),
+              ("srv_gen_tps", "Output tokens/s (vLLM counter)")]
+    fig, axes = plt.subplots(2, 3, figsize=(16, 9))
+    axes = axes.flatten()
     for cfg, s in monitored.items():
         style = "-" if cfg.endswith("seq8") else "--"
-        axes[0].plot(s["mon_rates"], s["gpu_util"], style, marker="o", label=cfg)
-        axes[1].plot(s["mon_rates"], s["cpu_vllm"], style, marker="o", label=cfg)
-        axes[2].plot(s["mon_rates"], s["kv_peak"], style, marker="o", label=cfg)
-    axes[0].set_ylabel("Mean GPU utilization (%)")
-    axes[1].set_ylabel("Mean vLLM CPU (%, 100 = one core)")
-    axes[2].set_ylabel("Peak KV cache usage (%)")
+        for ax, (key, _) in zip(axes, panels):
+            ax.plot(s["mon_rates"], s[key], style, marker="o", label=cfg)
+    for ax, (_, label) in zip(axes, panels):
+        ax.set_ylabel(label)
     for ax in axes:
         ax.set_xlabel("Configured average arrival rate (requests/s)")
         ax.grid(alpha=0.3)
@@ -131,6 +144,14 @@ if monitored:
     fig.tight_layout()
     fig.savefig("plots/sweep_resources.png", dpi=160)
     print("Saved plots/sweep_resources.png")
+
+    print(f"\n{'config':<14} {'rate':>5} {'gpu%':>5} {'cpu%':>6} {'kv%':>5} "
+          f"{'queue ms':>9} {'preempt':>8} {'gen tok/s':>10}")
+    for cfg, s in monitored.items():
+        for i, rate in enumerate(s["mon_rates"]):
+            print(f"{cfg:<14} {rate:>5} {s['gpu_util'][i]:>5.0f} {s['cpu_vllm'][i]:>6.0f} "
+                  f"{s['kv_peak'][i]:>5.1f} {s['queue_ms'][i]:>9.1f} "
+                  f"{s['preempt'][i]:>8.0f} {s['srv_gen_tps'][i]:>10.1f}")
 else:
     print(f"No monitor-rate-*.csv under {SWEEP}/; skipping resource plot")
 

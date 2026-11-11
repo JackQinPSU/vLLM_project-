@@ -12,6 +12,12 @@ Columns:
   cpu_vllm            CPU % of the vLLM server process tree (100 = one full core)
   running, waiting    vLLM scheduler queue (from /metrics)
   kv_cache            vLLM KV cache usage, 0-1
+  queue_time_sum      cumulative seconds requests spent queued (vllm:request_queue_time_seconds)
+  queue_time_count    cumulative requests that left the queue
+  preemptions         cumulative preemptions (vllm:num_preemptions_total; KV cache ran out)
+  gen_tokens          cumulative output tokens (vllm:generation_tokens_total)
+  prompt_tokens       cumulative prompt tokens (vllm:prompt_tokens_total)
+Cumulative counters reset when vLLM restarts; take last - first within one run.
 """
 import argparse
 import csv
@@ -24,10 +30,16 @@ import psutil
 import pynvml
 
 FIELDS = ["t_s", "unix_s", "gpu_util", "gpu_mem_util", "gpu_mem_mb", "gpu_power_w",
-          "gpu_sm_mhz", "cpu_total", "cpu_vllm", "running", "waiting", "kv_cache"]
+          "gpu_sm_mhz", "cpu_total", "cpu_vllm", "running", "waiting", "kv_cache",
+          "queue_time_sum", "queue_time_count", "preemptions", "gen_tokens", "prompt_tokens"]
 METRICS = {"running": "vllm:num_requests_running",
            "waiting": "vllm:num_requests_waiting",
-           "kv_cache": "vllm:kv_cache_usage_perc"}
+           "kv_cache": "vllm:kv_cache_usage_perc",
+           "queue_time_sum": "vllm:request_queue_time_seconds_sum",
+           "queue_time_count": "vllm:request_queue_time_seconds_count",
+           "preemptions": "vllm:num_preemptions_total",
+           "gen_tokens": "vllm:generation_tokens_total",
+           "prompt_tokens": "vllm:prompt_tokens_total"}
 
 
 def scrape(port):
@@ -89,15 +101,17 @@ def main():
     psutil.cpu_percent(None)
     tree.sample()
 
-    start = time.time()
+    # monotonic clock for timing: WSL2 re-syncs its wall clock with Windows,
+    # which made t_s jump backwards/forwards by up to ~2 s
+    start = time.monotonic()
     with open(args.output, "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=FIELDS)
         w.writeheader()
         next_t = start + args.interval
         while not stop:
-            time.sleep(max(0, next_t - time.time()))
+            time.sleep(max(0, next_t - time.monotonic()))
             next_t += args.interval
-            now = time.time()
+            now = time.monotonic()
             util = pynvml.nvmlDeviceGetUtilizationRates(gpu)
             try:
                 power = round(pynvml.nvmlDeviceGetPowerUsage(gpu) / 1000, 1)
@@ -105,7 +119,7 @@ def main():
                 power = ""
             w.writerow({
                 "t_s": round(now - start, 3),
-                "unix_s": round(now, 3),
+                "unix_s": round(time.time(), 3),
                 "gpu_util": util.gpu,
                 "gpu_mem_util": util.memory,
                 "gpu_mem_mb": pynvml.nvmlDeviceGetMemoryInfo(gpu).used // 2**20,
