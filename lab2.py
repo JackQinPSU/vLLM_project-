@@ -4,6 +4,7 @@ import hashlib
 import json
 import random
 import statistics
+import uuid
 from pathlib import Path
 
 import aiohttp
@@ -87,7 +88,7 @@ def generate(args):
     print("Classes:", {kind: kinds.count(kind) for kind in set(kinds)})
 
 
-async def send(session, request, start, trace_hash):
+async def send(session, request, start, trace_hash, run_tag=""):
     loop = asyncio.get_running_loop()
     await asyncio.sleep(max(0, start + request["arrival_s"] - loop.time()))
     sent = loop.time()
@@ -98,7 +99,8 @@ async def send(session, request, start, trace_hash):
 
     payload = {
         "model": MODEL,
-        "messages": [{"role": "user", "content": request["prompt"]}],
+        # run_tag goes first so prompts never share a cached prefix across runs
+        "messages": [{"role": "user", "content": run_tag + request["prompt"]}],
         "temperature": 0,
         "max_tokens": request["max_tokens"],
         "ignore_eos": True,
@@ -161,6 +163,7 @@ async def replay_async(args):
     trace_bytes = Path(args.trace).read_bytes()
     trace_hash = hashlib.sha256(trace_bytes).hexdigest()
     requests = read_jsonl(args.trace)
+    run_tag = f"[run {args.run_tag or uuid.uuid4().hex[:12]}] "
     timeout = aiohttp.ClientTimeout(total=300)
     connector = aiohttp.TCPConnector(limit=0)
 
@@ -175,13 +178,13 @@ async def replay_async(args):
                               prompt=f"Seperate warmup request for {kind}." + example["prompt"],
                               )
                 warmup_result = await send(session, warmup, asyncio.get_running_loop().time(),
-                           trace_hash)
+                           trace_hash, run_tag)
                 if not warmup_result["success"]:
                     raise RuntimeError(f"Warmup failed: {warmup_result['error']}")
 
         start = asyncio.get_running_loop().time()
         tasks = [
-            asyncio.create_task(send(session, request, start, trace_hash))
+            asyncio.create_task(send(session, request, start, trace_hash, run_tag))
             for request in requests
         ]
         results = await asyncio.gather(*tasks)
@@ -250,6 +253,8 @@ def main():
     r = commands.add_parser("replay")
     r.add_argument("--trace", required=True)
     r.add_argument("--output", required=True)
+    r.add_argument("--run-tag", default=None,
+                   help="Prefix added to every prompt so runs never hit each other's prefix cache (default: random per run)")
 
     p = commands.add_parser("report")
     p.add_argument("--results", required=True)
