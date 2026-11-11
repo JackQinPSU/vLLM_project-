@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# vLLM server and sweep logs (debugging noise, regenerated every run)
+results/**/server.log
+results/**/sweep.log
+*.log
+
+# Editor / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
