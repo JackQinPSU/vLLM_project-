@@ -89,6 +89,57 @@ The full tables for every config and rate are printed by `plot_sweep.py`. Per-ru
 - At 0.5 req/s, TTFT is slightly higher than at 1 req/s. My guess is the laptop GPU clocking down between sparse requests, but I haven't confirmed it.
 - The monitor's vLLM counters were added partway through, so `tok512-seq8` has no queue or preemption data.
 
+## KV cache calculator
+
+`kv_calc.py` predicts how much KV cache a model needs and checks that prediction against vLLM in two ways.
+
+Every token stores one key vector and one value vector in every layer:
+
+```
+bytes per token = 2 × layers × kv_heads × head_dim × bytes per element
+```
+
+For Qwen2.5-1.5B that's 2 × 28 × 2 × 128 × 2 = **28,672 bytes (28 KiB) per token** in FP16. The model uses grouped-query attention, with 12 query heads sharing 2 KV heads, so the cache is 6x smaller than it would be with full multi-head attention. A full 4,096-token request takes 112 MiB.
+
+### Check 1: capacity at startup
+
+vLLM logs how much memory it gives the KV cache and how many tokens fit in it. Here is the predicted capacity next to vLLM's number for each config:
+
+| config | KV memory | vLLM tokens | predicted range | error |
+|---|---|---|---|---|
+| tok512-seq8 | 3.24 GiB | 121,344 | 121,136–121,520 | -0.01% |
+| tok512-seq16 | 3.19 GiB | 119,376 | 119,264–119,648 | +0.07% |
+| tok1024-seq8 | 3.19 GiB | 119,408 | 119,264–119,648 | +0.04% |
+| tok1024-seq16 | 3.16 GiB | 118,176 | 118,144–118,512 | +0.14% |
+| tok2048-seq8 | 3.13 GiB | 117,232 | 117,024–117,392 | -0.03% |
+| tok2048-seq16 | 3.10 GiB | 116,000 | 115,904–116,272 | +0.07% |
+
+The prediction is a range because vLLM rounds the memory it prints to 0.01 GiB. All six token counts fall inside their range.
+
+One thing I didn't expect: the KV cache gets less memory as the scheduler limits grow. Going from `tok512-seq8` to `tok2048-seq16` costs about 0.14 GiB, or roughly 5,300 tokens of cache. My guess is that vLLM sizes its activation memory for a full batch at startup, so a bigger batch leaves less room for the cache. I haven't confirmed that in vLLM's code.
+
+### Check 2: usage over time
+
+From each run's per-request results (first-token time, finish time, prompt and output tokens), the calculator rebuilds which requests were in the cache at each moment and how many blocks each one held. It then compares that with the `kv_cache` gauge the monitor scraped from vLLM.
+
+![kv predicted vs measured](plots/kv_predicted_vs_measured.png)
+
+The model is simple:
+- A request's prompt is in the cache from its first token until it finishes.
+- Its output grows linearly over that time.
+- Each request rounds up to whole 16-token blocks.
+- Requests waiting in the queue hold nothing.
+
+The two clocks are lined up using vLLM's cumulative generated-token counter, so the alignment doesn't depend on the KV prediction being tested.
+
+Results:
+- In 25 of the 30 runs, the average error is under 1 percentage point. Peaks match to within about 0.5 pp.
+- The prediction usually runs about 0.3 pp high at peaks. That's probably prefix caching: every request starts with the same chat-template system prompt, and vLLM stores those blocks once instead of once per request.
+- The small bump near the start of every measured curve comes from the warmup requests, which aren't in the results files.
+- The worst run is `tok1024-seq8` at 6 req/s, with a 1.4 pp error. Its prediction runs ahead early and behind later, which looks like a time stretch. That could come from the old wall-clock timestamps in its monitor CSV, but I haven't confirmed it.
+
+In these runs, cache usage peaked at 16% and nothing was ever preempted. The bottleneck was `max-num-seqs`, not memory.
+
 ## Running it
 
 Requirements: Python with `vllm==0.32.0`, `aiohttp`, `transformers`, `psutil`, `pynvml` and `matplotlib` in `.venv/`.
@@ -112,6 +163,19 @@ python lab2.py replay --trace traces/mixed-rate-2.jsonl --output results/test.js
 python lab2.py report --results results/test.jsonl
 ```
 
+KV cache calculator:
+
+```bash
+# bytes per token and capacity for a given amount of KV memory (try --dtype fp8)
+python kv_calc.py --kv-mem-gib 3.16
+
+# check capacity against vLLM's startup logs
+python kv_calc.py --server-log results/sweep-mon/*/server.log
+
+# predicted vs measured usage over time for a whole sweep
+python kv_calc.py --sweep results/sweep-mon
+```
+
 ## Files
 
 | file | what it does |
@@ -121,6 +185,7 @@ python lab2.py report --results results/test.jsonl
 | `sweep.sh` | runs every config × rate combination |
 | `plot_sweep.py` | summary tables and sweep plots |
 | `plot_monitor.py` | per-run metric plots over time |
+| `kv_calc.py` | KV cache size calculator, checked against vLLM logs and live usage |
 | `traces/` | request traces |
 | `results/sweep-mon/` | raw per-request results and monitor CSVs |
 | `plots/` | generated figures |
