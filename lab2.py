@@ -26,9 +26,124 @@ def write_jsonl(path, rows):
     )
 
 
+WORDS = (
+    "scheduler cache token block prefill decode batch latency throughput memory "
+    "kernel tensor layer attention queue worker router request stream replica "
+    "cluster bandwidth compute model weight context window prompt output budget "
+    "policy priority deadline fairness eviction capacity utilization pipeline "
+    "stage shard node network storage index hash tree prefix suffix server "
+    "client trace metric sample profile report"
+).split()
+
+
+def filler(rng, tokenizer, header, n_tokens):
+    """`header` followed by random words, cut to about n_tokens tokens."""
+    words = " ".join(rng.choice(WORDS) for _ in range(n_tokens))
+    ids = tokenizer.encode(f"{header} {words}", add_special_tokens=False)[:n_tokens]
+    return tokenizer.decode(ids)
+
+
+def make_row(tokenizer, request_id, kind, arrival, max_tokens,
+             prompt=None, messages=None, **extra):
+    chat = messages or [{"role": "user", "content": prompt}]
+    chat_text = tokenizer.apply_chat_template(
+        chat, tokenize=False, add_generation_prompt=True
+    )
+    actual_input = len(tokenizer.encode(chat_text, add_special_tokens=False))
+    if actual_input + max_tokens > 4096:
+        raise ValueError(f"{request_id} exceeds the server context limit")
+    row = {
+        "id": request_id,
+        "class": kind,
+        "arrival_s": round(arrival, 6),
+        "input_tokens": actual_input,
+        "max_tokens": max_tokens,
+        **extra,
+    }
+    if messages:
+        row["messages"] = messages
+    else:
+        row["prompt"] = prompt
+    return row
+
+
+def generate_docs(args, rng, tokenizer):
+    """K long documents; each request is one document plus a short question.
+    Requests on the same document share its whole prefix. --zipf > 0 makes
+    low-numbered documents more popular (hot prefixes)."""
+    docs = [filler(rng, tokenizer, f"Document {g}.", rng.randint(1500, 2500))
+            for g in range(args.groups)]
+    weights = [1 / (g + 1) ** args.zipf for g in range(args.groups)]
+    rows, arrival = [], 0.0
+    for i in range(args.n):
+        if i:
+            arrival += rng.expovariate(args.rate)
+        group = rng.choices(range(args.groups), weights)[0]
+        question = filler(rng, tokenizer, f"Question {i}:", rng.randint(20, 60))
+        rows.append(make_row(tokenizer, f"docs-{i:04d}", "doc", arrival, 96,
+                             prompt=f"{docs[group]}\n\n{question}", group=group))
+    return rows
+
+
+def generate_multiturn(args, rng, tokenizer):
+    """Conversations of --turns turns. Each turn resends the whole history, so
+    turn t reuses all of turn t-1's prompt. Assistant replies in the history
+    are fixed text from the trace, not what the model actually said, so the
+    model's own output blocks are never reused. Conversations start as a
+    Poisson process at rate/turns, so the overall request rate is about --rate;
+    the next turn comes 2 s + exp(mean --think-s) after the previous one."""
+    conversations = max(1, args.n // args.turns)
+    rows, start = [], 0.0
+    for c in range(conversations):
+        if c:
+            start += rng.expovariate(args.rate / args.turns)
+        arrival, messages = start, []
+        for t in range(args.turns):
+            if t == 0:
+                content = filler(rng, tokenizer, f"Conversation {c}. Background:",
+                                 rng.randint(400, 800))
+            else:
+                arrival += 2.0 + rng.expovariate(1 / args.think_s)
+                content = filler(rng, tokenizer, f"Follow-up {t}:", rng.randint(40, 120))
+            messages = messages + [{"role": "user", "content": content}]
+            rows.append(make_row(tokenizer, f"conv{c:03d}-t{t}", "turn", arrival, 96,
+                                 messages=messages, conversation=c, turn=t))
+            reply = filler(rng, tokenizer, "Answer:", rng.randint(80, 150))
+            messages = messages + [{"role": "assistant", "content": reply}]
+    rows.sort(key=lambda r: r["arrival_s"])
+    return rows
+
+
+def ideal_reuse(rows, tokenizer, block_size=16):
+    """Share of prompt blocks that could be prefix-cache hits with one shared,
+    infinite cache, ignoring timing. An upper bound for any router."""
+    seen, hits, total = set(), 0, 0
+    for row in sorted(rows, key=lambda r: r["arrival_s"]):
+        chat = row.get("messages") or [{"role": "user", "content": row["prompt"]}]
+        text = tokenizer.apply_chat_template(chat, tokenize=False, add_generation_prompt=True)
+        ids = tokenizer.encode(text, add_special_tokens=False)
+        parent, matching = None, True
+        for start in range(0, len(ids) - block_size + 1, block_size):
+            parent = hash((parent, tuple(ids[start:start + block_size])))
+            total += 1
+            matching = matching and parent in seen
+            hits += matching
+            seen.add(parent)
+    return hits / total if total else 0.0
+
+
 def generate(args):
     rng = random.Random(args.seed)
     tokenizer = AutoTokenizer.from_pretrained(MODEL, revision=REVISION)
+
+    if args.family in ("docs", "multiturn"):
+        make = generate_docs if args.family == "docs" else generate_multiturn
+        rows = make(args, rng, tokenizer)
+        write_jsonl(args.output, rows)
+        print(f"Wrote {len(rows)} requests to {args.output}")
+        print(f"Upper bound on prefix reuse (one shared cache, no timing): "
+              f"{ideal_reuse(rows, tokenizer):.1%}")
+        return
 
     if args.family == "short":
         kinds = ["short"] * args.n
@@ -97,10 +212,12 @@ async def send(session, request, start, trace_hash, run_tag="", model=MODEL):
     done = False
     error = None
 
+    messages = request.get("messages") or [{"role": "user", "content": request["prompt"]}]
+    # run_tag goes first so prompts never share a cached prefix across runs
+    messages = [dict(messages[0], content=run_tag + messages[0]["content"])] + messages[1:]
     payload = {
         "model": model,
-        # run_tag goes first so prompts never share a cached prefix across runs
-        "messages": [{"role": "user", "content": run_tag + request["prompt"]}],
+        "messages": messages,
         "temperature": 0,
         "max_tokens": request["max_tokens"],
         "ignore_eos": True,
@@ -169,14 +286,15 @@ async def replay_async(args):
 
     async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
         # Separate warmup requests; they are excluded from the measured trace.
-        for kind in ("short", "long", "generation"):
+        for kind in class_order(requests):
             example = next((r for r in requests if r["class"] == kind), None)
             if example:
-                warmup = dict(example, 
-                              id="warmup-" + kind, 
+                # Warmup text goes first so it never pre-fills the trace's shared prefixes.
+                text = example.get("prompt") or example["messages"][0]["content"]
+                warmup = {k: v for k, v in example.items() if k != "messages"}
+                warmup.update(id="warmup-" + kind,
                               arrival_s=0,
-                              prompt=f"Seperate warmup request for {kind}." + example["prompt"],
-                              )
+                              prompt=f"Seperate warmup request for {kind}." + text)
                 warmup_result = await send(session, warmup, asyncio.get_running_loop().time(),
                            trace_hash, run_tag, args.model)
                 if not warmup_result["success"]:
@@ -194,6 +312,13 @@ async def replay_async(args):
     print(f"Trace SHA-256: {trace_hash}")
 
 
+def class_order(rows):
+    """Request classes present, original classes first in their original order."""
+    present = {r["class"] for r in rows}
+    original = [k for k in ("short", "long", "generation") if k in present]
+    return original + sorted(present - set(original))
+
+
 def percentile(values, fraction):
     if not values:
         return None
@@ -207,7 +332,7 @@ def percentile(values, fraction):
 def report(args):
     rows = read_jsonl(args.results)
     duration = max((r["finish_s"] for r in rows), default=0)
-    for kind in ["ALL", "short", "long", "generation"]:
+    for kind in ["ALL"] + class_order(rows):
         group = rows if kind == "ALL" else [r for r in rows if r["class"] == kind]
         if not group:
             continue
@@ -242,8 +367,15 @@ def main():
     commands = parser.add_subparsers(dest="command", required=True)
 
     g = commands.add_parser("generate")
-    g.add_argument("--family", choices=["short", "mixed", "burst", "generation"],
-                   required=True)
+    g.add_argument("--family", required=True,
+                   choices=["short", "mixed", "burst", "generation", "docs", "multiturn"])
+    g.add_argument("--groups", type=int, default=8,
+                   help="docs: number of distinct documents")
+    g.add_argument("--zipf", type=float, default=0.0,
+                   help="docs: popularity skew; 0 = uniform, 1 = document k asked 1/k as often")
+    g.add_argument("--turns", type=int, default=5, help="multiturn: turns per conversation")
+    g.add_argument("--think-s", type=float, default=4.0,
+                   help="multiturn: mean extra seconds between turns (on top of 2 s)")
     g.add_argument("--rate", type=float, default=0.7, 
                     help="Average request per second")
     g.add_argument("--n", type=int, default=20)
