@@ -88,7 +88,7 @@ def generate(args):
     print("Classes:", {kind: kinds.count(kind) for kind in set(kinds)})
 
 
-async def send(session, request, start, trace_hash, run_tag=""):
+async def send(session, request, start, trace_hash, run_tag="", model=MODEL):
     loop = asyncio.get_running_loop()
     await asyncio.sleep(max(0, start + request["arrival_s"] - loop.time()))
     sent = loop.time()
@@ -98,7 +98,7 @@ async def send(session, request, start, trace_hash, run_tag=""):
     error = None
 
     payload = {
-        "model": MODEL,
+        "model": model,
         # run_tag goes first so prompts never share a cached prefix across runs
         "messages": [{"role": "user", "content": run_tag + request["prompt"]}],
         "temperature": 0,
@@ -178,13 +178,13 @@ async def replay_async(args):
                               prompt=f"Seperate warmup request for {kind}." + example["prompt"],
                               )
                 warmup_result = await send(session, warmup, asyncio.get_running_loop().time(),
-                           trace_hash, run_tag)
+                           trace_hash, run_tag, args.model)
                 if not warmup_result["success"]:
                     raise RuntimeError(f"Warmup failed: {warmup_result['error']}")
 
         start = asyncio.get_running_loop().time()
         tasks = [
-            asyncio.create_task(send(session, request, start, trace_hash, run_tag))
+            asyncio.create_task(send(session, request, start, trace_hash, run_tag, args.model))
             for request in requests
         ]
         results = await asyncio.gather(*tasks)
@@ -255,6 +255,8 @@ def main():
     r.add_argument("--output", required=True)
     r.add_argument("--run-tag", default=None,
                    help="Prefix added to every prompt so runs never hit each other's prefix cache (default: random per run)")
+    r.add_argument("--model", default=MODEL,
+                   help="model name sent in each request; must match what the server serves")
 
     p = commands.add_parser("report")
     p.add_argument("--results", required=True)
