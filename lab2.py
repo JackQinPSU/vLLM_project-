@@ -222,7 +222,7 @@ def generate(args):
 
 # ---- replay ----
 
-async def send(session, request, start, trace_hash, run_tag="", model=MODEL):
+async def send(session, request, start, trace_hash, run_tag="", model=MODEL, url=URL):
     """Send one request at its planned time, stream the reply, return timings."""
     loop = asyncio.get_running_loop()
     # Open loop: wait for the planned arrival time, regardless of earlier requests.
@@ -247,7 +247,7 @@ async def send(session, request, start, trace_hash, run_tag="", model=MODEL):
     }
 
     try:
-        async with session.post(URL, json=payload) as response:
+        async with session.post(url, json=payload) as response:
             if response.status != 200:
                 raise RuntimeError(
                     f"HTTP {response.status}: {(await response.text())[:300]}"
@@ -318,14 +318,15 @@ async def replay_async(args):
                               arrival_s=0,
                               prompt=f"Seperate warmup request for {kind}." + text)
                 warmup_result = await send(session, warmup, asyncio.get_running_loop().time(),
-                           trace_hash, run_tag, args.model)
+                           trace_hash, run_tag, args.model, args.url)
                 if not warmup_result["success"]:
                     raise RuntimeError(f"Warmup failed: {warmup_result['error']}")
 
         # All requests are scheduled at once; each sleeps until its arrival time.
         start = asyncio.get_running_loop().time()
         tasks = [
-            asyncio.create_task(send(session, request, start, trace_hash, run_tag, args.model))
+            asyncio.create_task(send(session, request, start, trace_hash, run_tag,
+                                     args.model, args.url))
             for request in requests
         ]
         results = await asyncio.gather(*tasks)
@@ -418,6 +419,7 @@ def main():
                    help="Prefix added to every prompt so runs never hit each other's prefix cache (default: random per run)")
     r.add_argument("--model", default=MODEL,
                    help="model name sent in each request; must match what the server serves")
+    r.add_argument("--url", default=URL, help="chat completions endpoint")
 
     p = commands.add_parser("report")
     p.add_argument("--results", required=True)
