@@ -1,3 +1,9 @@
+"""Generate request traces, replay them against an OpenAI-compatible server, report latency.
+
+    python lab2.py generate --family mixed --rate 2 --n 60 --output traces/x.jsonl
+    python lab2.py replay   --trace traces/x.jsonl --output results/x.jsonl
+    python lab2.py report   --results results/x.jsonl
+"""
 import argparse
 import asyncio
 import hashlib
@@ -11,7 +17,7 @@ import aiohttp
 from transformers import AutoTokenizer
 
 MODEL = "Qwen/Qwen2.5-1.5B-Instruct"
-REVISION = "989aa7980e4cf806f80c7fef2b1adb7bc71aa306"
+REVISION = "989aa7980e4cf806f80c7fef2b1adb7bc71aa306"  # pinned for reproducibility
 URL = "http://localhost:8000/v1/chat/completions"
 
 
@@ -26,6 +32,9 @@ def write_jsonl(path, rows):
     )
 
 
+# ---- trace generation: shared-prefix families (docs, multiturn) ----
+
+# Vocabulary for random filler text.
 WORDS = (
     "scheduler cache token block prefill decode batch latency throughput memory "
     "kernel tensor layer attention queue worker router request stream replica "
@@ -37,7 +46,7 @@ WORDS = (
 
 
 def filler(rng, tokenizer, header, n_tokens):
-    """`header` followed by random words, cut to about n_tokens tokens."""
+    """`header` + random words, cut to ~n_tokens tokens."""
     words = " ".join(rng.choice(WORDS) for _ in range(n_tokens))
     ids = tokenizer.encode(f"{header} {words}", add_special_tokens=False)[:n_tokens]
     return tokenizer.decode(ids)
@@ -45,12 +54,14 @@ def filler(rng, tokenizer, header, n_tokens):
 
 def make_row(tokenizer, request_id, kind, arrival, max_tokens,
              prompt=None, messages=None, **extra):
+    """One trace row. Pass `prompt` (single turn) or `messages` (multi-turn)."""
+    # Count input tokens the way the server sees them: with the chat template.
     chat = messages or [{"role": "user", "content": prompt}]
     chat_text = tokenizer.apply_chat_template(
         chat, tokenize=False, add_generation_prompt=True
     )
     actual_input = len(tokenizer.encode(chat_text, add_special_tokens=False))
-    if actual_input + max_tokens > 4096:
+    if actual_input + max_tokens > 4096:  # server's --max-model-len
         raise ValueError(f"{request_id} exceeds the server context limit")
     row = {
         "id": request_id,
@@ -58,7 +69,7 @@ def make_row(tokenizer, request_id, kind, arrival, max_tokens,
         "arrival_s": round(arrival, 6),
         "input_tokens": actual_input,
         "max_tokens": max_tokens,
-        **extra,
+        **extra,  # e.g. group, conversation, turn
     }
     if messages:
         row["messages"] = messages
@@ -68,16 +79,15 @@ def make_row(tokenizer, request_id, kind, arrival, max_tokens,
 
 
 def generate_docs(args, rng, tokenizer):
-    """K long documents; each request is one document plus a short question.
-    Requests on the same document share its whole prefix. --zipf > 0 makes
-    low-numbered documents more popular (hot prefixes)."""
+    """Each request = one of --groups long documents + a short question.
+    Same document -> shared prefix. --zipf > 0 makes low-numbered docs hot."""
     docs = [filler(rng, tokenizer, f"Document {g}.", rng.randint(1500, 2500))
             for g in range(args.groups)]
-    weights = [1 / (g + 1) ** args.zipf for g in range(args.groups)]
+    weights = [1 / (g + 1) ** args.zipf for g in range(args.groups)]  # zipf=0 -> uniform
     rows, arrival = [], 0.0
     for i in range(args.n):
         if i:
-            arrival += rng.expovariate(args.rate)
+            arrival += rng.expovariate(args.rate)  # Poisson arrivals
         group = rng.choices(range(args.groups), weights)[0]
         question = filler(rng, tokenizer, f"Question {i}:", rng.randint(20, 60))
         rows.append(make_row(tokenizer, f"docs-{i:04d}", "doc", arrival, 96,
@@ -86,16 +96,15 @@ def generate_docs(args, rng, tokenizer):
 
 
 def generate_multiturn(args, rng, tokenizer):
-    """Conversations of --turns turns. Each turn resends the whole history, so
-    turn t reuses all of turn t-1's prompt. Assistant replies in the history
-    are fixed text from the trace, not what the model actually said, so the
-    model's own output blocks are never reused. Conversations start as a
-    Poisson process at rate/turns, so the overall request rate is about --rate;
-    the next turn comes 2 s + exp(mean --think-s) after the previous one."""
+    """Conversations of --turns turns; each turn resends the full history,
+    so turn t reuses all of turn t-1's prompt.
+    Assistant replies are fixed trace text (not the model's real output),
+    so only prompt blocks are reusable, never generated ones."""
     conversations = max(1, args.n // args.turns)
     rows, start = [], 0.0
     for c in range(conversations):
         if c:
+            # Conversations start at rate/turns, so total request rate ~ --rate.
             start += rng.expovariate(args.rate / args.turns)
         arrival, messages = start, []
         for t in range(args.turns):
@@ -103,6 +112,7 @@ def generate_multiturn(args, rng, tokenizer):
                 content = filler(rng, tokenizer, f"Conversation {c}. Background:",
                                  rng.randint(400, 800))
             else:
+                # User "thinks" 2 s + exp(mean --think-s) before the next turn.
                 arrival += 2.0 + rng.expovariate(1 / args.think_s)
                 content = filler(rng, tokenizer, f"Follow-up {t}:", rng.randint(40, 120))
             messages = messages + [{"role": "user", "content": content}]
@@ -110,13 +120,13 @@ def generate_multiturn(args, rng, tokenizer):
                                  messages=messages, conversation=c, turn=t))
             reply = filler(rng, tokenizer, "Answer:", rng.randint(80, 150))
             messages = messages + [{"role": "assistant", "content": reply}]
-    rows.sort(key=lambda r: r["arrival_s"])
+    rows.sort(key=lambda r: r["arrival_s"])  # interleave conversations by time
     return rows
 
 
 def ideal_reuse(rows, tokenizer, block_size=16):
-    """Share of prompt blocks that could be prefix-cache hits with one shared,
-    infinite cache, ignoring timing. An upper bound for any router."""
+    """Max fraction of prompt blocks that could hit the prefix cache
+    (one shared infinite cache, timing ignored). Upper bound for any router."""
     seen, hits, total = set(), 0, 0
     for row in sorted(rows, key=lambda r: r["arrival_s"]):
         chat = row.get("messages") or [{"role": "user", "content": row["prompt"]}]
@@ -124,13 +134,16 @@ def ideal_reuse(rows, tokenizer, block_size=16):
         ids = tokenizer.encode(text, add_special_tokens=False)
         parent, matching = None, True
         for start in range(0, len(ids) - block_size + 1, block_size):
+            # Chained hash: block i's hash covers all blocks before it.
             parent = hash((parent, tuple(ids[start:start + block_size])))
             total += 1
-            matching = matching and parent in seen
+            matching = matching and parent in seen  # stop at first miss
             hits += matching
             seen.add(parent)
     return hits / total if total else 0.0
 
+
+# ---- trace generation: entry point + original families ----
 
 def generate(args):
     rng = random.Random(args.seed)
@@ -145,6 +158,8 @@ def generate(args):
               f"{ideal_reuse(rows, tokenizer):.1%}")
         return
 
+    # Original families. Request mix:
+    #   short: all short | mixed/burst: 20% long | generation: 60% long-output
     if args.family == "short":
         kinds = ["short"] * args.n
     elif args.family in ("mixed", "burst"):
@@ -162,9 +177,10 @@ def generate(args):
         if i:
             rate = args.rate
             if args.family == "burst" and i >= args.n //2:
-                rate *= 4
-            arrival += rng.expovariate(rate)
+                rate *= 4  # second half arrives 4x faster
+            arrival += rng.expovariate(rate)  # Poisson arrivals
 
+        # (prompt tokens, output tokens) per class
         if kind == "long":
             target, output = rng.randint(2200, 2900), 128
         elif kind == "generation":
@@ -172,6 +188,7 @@ def generate(args):
         else:
             target, output = rng.randint(180, 320), 96
 
+        # Request id comes first, so no two requests share a cached prefix.
         request_id = f"{args.family}-{i:04d}"
         material = (
             f"Request {request_id}. Summarize the following notes: "
@@ -203,11 +220,15 @@ def generate(args):
     print("Classes:", {kind: kinds.count(kind) for kind in set(kinds)})
 
 
+# ---- replay ----
+
 async def send(session, request, start, trace_hash, run_tag="", model=MODEL):
+    """Send one request at its planned time, stream the reply, return timings."""
     loop = asyncio.get_running_loop()
+    # Open loop: wait for the planned arrival time, regardless of earlier requests.
     await asyncio.sleep(max(0, start + request["arrival_s"] - loop.time()))
     sent = loop.time()
-    first = None
+    first = None   # time of first generated token
     usage = {}
     done = False
     error = None
@@ -220,7 +241,7 @@ async def send(session, request, start, trace_hash, run_tag="", model=MODEL):
         "messages": messages,
         "temperature": 0,
         "max_tokens": request["max_tokens"],
-        "ignore_eos": True,
+        "ignore_eos": True,  # always generate exactly max_tokens
         "stream": True,
         "stream_options": {"include_usage": True},
     }
@@ -231,6 +252,7 @@ async def send(session, request, start, trace_hash, run_tag="", model=MODEL):
                 raise RuntimeError(
                     f"HTTP {response.status}: {(await response.text())[:300]}"
                 )
+            # Server-sent events: one "data: {...}" line per chunk.
             async for raw_line in response.content:
                 line = raw_line.decode("utf-8", errors="replace").strip()
                 if not line.startswith("data: "):
@@ -260,7 +282,7 @@ async def send(session, request, start, trace_hash, run_tag="", model=MODEL):
         "trace_sha256": trace_hash,
         "planned_arrival_s": request["arrival_s"],
         "actual_send_s": round(sent - start, 6),
-        "send_lateness_s": round(sent - start - request["arrival_s"], 6),
+        "send_lateness_s": round(sent - start - request["arrival_s"], 6),  # client overload check
         "finish_s": round(finished - start, 6),
         "input_tokens": usage.get("prompt_tokens", request["input_tokens"]),
         "requested_output_tokens": request["max_tokens"],
@@ -278,11 +300,11 @@ async def send(session, request, start, trace_hash, run_tag="", model=MODEL):
 
 async def replay_async(args):
     trace_bytes = Path(args.trace).read_bytes()
-    trace_hash = hashlib.sha256(trace_bytes).hexdigest()
+    trace_hash = hashlib.sha256(trace_bytes).hexdigest()  # proves which trace was used
     requests = read_jsonl(args.trace)
     run_tag = f"[run {args.run_tag or uuid.uuid4().hex[:12]}] "
     timeout = aiohttp.ClientTimeout(total=300)
-    connector = aiohttp.TCPConnector(limit=0)
+    connector = aiohttp.TCPConnector(limit=0)  # no client-side connection cap
 
     async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
         # Separate warmup requests; they are excluded from the measured trace.
@@ -300,6 +322,7 @@ async def replay_async(args):
                 if not warmup_result["success"]:
                     raise RuntimeError(f"Warmup failed: {warmup_result['error']}")
 
+        # All requests are scheduled at once; each sleeps until its arrival time.
         start = asyncio.get_running_loop().time()
         tasks = [
             asyncio.create_task(send(session, request, start, trace_hash, run_tag, args.model))
@@ -312,6 +335,8 @@ async def replay_async(args):
     print(f"Trace SHA-256: {trace_hash}")
 
 
+# ---- report ----
+
 def class_order(rows):
     """Request classes present, original classes first in their original order."""
     present = {r["class"] for r in rows}
@@ -320,6 +345,7 @@ def class_order(rows):
 
 
 def percentile(values, fraction):
+    """Linear-interpolated percentile, e.g. fraction=.95 for p95."""
     if not values:
         return None
     values = sorted(values)
@@ -337,6 +363,7 @@ def report(args):
         if not group:
             continue
         completed = [r for r in group if r["success"]]
+        # "Good" = finished and met both SLOs.
         good = [
             r for r in completed
             if r["ttft_s"] <= args.ttft_slo
@@ -362,6 +389,8 @@ def report(args):
             print(f"FAIL {r['id']}: {r['error']}")
 
 
+# ---- CLI ----
+
 def main():
     parser = argparse.ArgumentParser()
     commands = parser.add_subparsers(dest="command", required=True)
@@ -376,7 +405,7 @@ def main():
     g.add_argument("--turns", type=int, default=5, help="multiturn: turns per conversation")
     g.add_argument("--think-s", type=float, default=4.0,
                    help="multiturn: mean extra seconds between turns (on top of 2 s)")
-    g.add_argument("--rate", type=float, default=0.7, 
+    g.add_argument("--rate", type=float, default=0.7,
                     help="Average request per second")
     g.add_argument("--n", type=int, default=20)
     g.add_argument("--seed", type=int, default=42)
